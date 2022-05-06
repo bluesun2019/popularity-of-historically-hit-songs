@@ -2,7 +2,7 @@
 This project aims to investigate the historical hit songs and design a simple method to identify those that are still popular on Spotify.  
 These songs are often called classics because they are not buried in oblivion over time. 
 ## Introduction
-* `EvolutionPopUSA_MainData.csv`    The data containing songs once entering the Billboard
+* `EvolutionPopUSA_MainData.csv`    Dataset containing songs once entering the Billboard
 * `Covering.RData`    Datasets containing information extracted from Spotify for part of songs in the first dataset
 * `oversampling methods.R` and `XGboost.R`     R functions for prediction
 * `Data_import_preprocess.R`    Code for data extraction and preprocessing (No need to run it)
