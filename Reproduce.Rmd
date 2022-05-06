@@ -1,0 +1,784 @@
+---
+title: "Reproduce"
+author: "Shi Haosheng"
+date: "2022/5/5"
+output: html_document
+---
+```{R,include=FALSE}
+library(knitr)
+library(spotifyr)
+library(billboard)
+library(tidyverse)
+library(dplyr)
+library(skimr)
+library(lubridate)
+library(ggplot2)
+library(cowplot)
+library(xgboost)
+library(pROC)
+library(RSNNS)
+library(caret)
+library(flextable)
+
+track_search<-function(no){
+  i=which(PopUSA_75s$number==no)
+  songs_after=as.data.frame(filter(song_75s,number==no))
+  temp2=filter(covering,grepl(tolower(PopUSA$track_name[no]),tolower(as.character(track_name)),fixed=TRUE))
+  temp=grepl(tolower(PopUSA_75s$artist_name[i]),tolower(select(songs_after,artist_name)[,1]),fixed=TRUE)
+  A=temp2%>%filter(grepl("-.*-",as.character(release_date)))%>%mutate(release_date=as.Date(release_date))
+  B=temp2%>%filter(!grepl("-",as.character(release_date)))
+  C=B%>%filter(as.numeric(as.character(release_date))==year(PopUSA$first_entry[no]))%>%mutate(release_date=PopUSA$first_entry[no]+30)
+  D=B%>%filter(as.numeric(as.character(release_date))!=year(PopUSA$first_entry[no]))%>%mutate(release_date=as.Date(release_date,"%Y"))
+  E=temp2%>%filter(!grepl("-.*-",as.character(release_date)))%>%filter(grepl("-",as.character(release_date)))
+  if(dim(E)[1]!=0){
+    E=E%>%mutate(release_date=as.Date(paste(as.character(release_date),"-01",sep = ""))+30 )
+    temp2<-full_join(full_join(full_join(A,C),D),E)%>%mutate(number=no)
+  }else{
+    temp2<-full_join(full_join(A,C),D)%>%mutate(number=no)
+  }}
+```
+
+## Data import and preprocessing
+```{R}
+load("Covering.RData")
+```
+
+## Classification
+```{R,include=FALSE}
+source('oversampling methods.R', echo=TRUE)
+source('XGboost.R', echo=TRUE)
+```
+### Difficulties of classification
+
+```{R,warning=FALSE,message=FALSE}
+show=data
+ggplot(show)+geom_histogram(aes(x=popularity,y=..density..))
+```
+
+Try to classify songs into 3 categories of [0,30],(30,60],(60,100]:
+
+Take a look at the distribution of these 3 categories. We can regard songs in (60,100] as high--popularity ones and those in [0,30] as low--popularity ones. Also we plot the combination of [0,25],[25,65],[65,100] and [0,35],[35,55],[55,100].
+
+```{R,message=FALSE}
+cate1=full_join(full_join(data_70s,data_80s),data_90s)%>%na.omit()%>%mutate(popularity_class=cut(popularity,breaks=c(0,25,65,100),include.lowest=TRUE))%>%group_by(popularity_class)%>%count()
+cate2=full_join(full_join(data_70s,data_80s),data_90s)%>%na.omit()%>%mutate(popularity_class=cut(popularity,breaks=c(0,35,55,100),include.lowest=TRUE))%>%group_by(popularity_class)%>%count()
+plot_cate=cbind(cate1,cate2)%>%select(2,4)%>%rename(low=1,high=2)%>%cbind(loc=1:3)
+ggplot(data,aes(x=popularity_class))+geom_bar(stat="count")+geom_segment(data=plot_cate,aes(x=loc-0.45,xend=loc+0.45,y=low,yend=low),color="dodgerblue")+geom_segment(data=plot_cate,aes(x=loc-0.45,xend=loc+0.45,y=high,yend=high),color="violet")
+```
+
+#### simple classification without oversampling
+
+Now use the dataset combining 70-72,80-82,90-92 hit songs. Use stratified sampling to divide the dataset as training set, validation set(used for early stopping) and testing set with similar distribution.
+
+A simple XGboost gives rise to results like this:
+
+```{R,message=FALSE}
+set.seed(1)
+reference=factor(c(),levels=c("[0,30]","(30,60]","(60,100]"))
+pred=c()
+for(i in 1:10){
+  result=simple_class(data)
+  reference=c(reference,result[[1]]$response)
+  pred=rbind(pred,result[[1]]$predictor)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+testpred_label=encodeClassLabels(pred,method="WTA",l=0,h=0)
+testpred_label=c("[0,30]","(30,60]","(60,100]")[testpred_label]
+indicator=confusionMatrix(data=factor(testpred_label,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+```
+
+```{R}
+kable(indicator$table/10)
+kable(t(indicator$byClass[,c(1,2,5,11)]))
+```
+
+
+#### simple classification with oversampling for the minority class
+
+First try a simple oversampling of the minority class.
+
+```{R,message=FALSE}
+
+set.seed(1)
+## partition data 
+train_index=createDataPartition(y=data$popularity_class,p=0.8,list=F)
+train_index2=sample(train_index,round(0.7*length(data$popularity_class)))
+valid_index=setdiff(train_index,train_index2)
+train_data=na.omit(data[train_index2,])
+validation_data=na.omit(data[valid_index,])
+test_data=na.omit(data[-train_index,])
+## balance data
+train_data_lebel=train_data$popularity_class
+train_data_max=max(table(train_data_lebel))
+train_data_new=c()
+for(i in 1:length(table(train_data_lebel))){
+  if(i==which.max(table(train_data_lebel))){
+    p_label=names(table(train_data_lebel))[i]
+    temp_num=table(train_data_lebel)[i]
+    temp=train_data%>%filter(popularity_class==p_label)
+  }else{
+    p_label=names(table(train_data_lebel))[i]
+    temp_num=table(train_data_lebel)[i]
+    pp=(train_data_max-temp_num)/temp_num
+    temp=train_data%>%filter(popularity_class==p_label)
+    oversample_label=sample(1:dim(temp)[1],round(pp*dim(temp)[1]),replace=TRUE)
+    temp=rbind(temp,temp[oversample_label,])
+  }
+  train_data_new=rbind(train_data_new,temp)
+}
+train_data=train_data_new
+
+
+cate1=train_data%>%na.omit()%>%mutate(popularity_class=cut(popularity,breaks=c(0,25,65,100),include.lowest=TRUE))%>%group_by(popularity_class)%>%dplyr::count()
+cate2=train_data%>%na.omit()%>%mutate(popularity_class=cut(popularity,breaks=c(0,35,55,100),include.lowest=TRUE))%>%group_by(popularity_class)%>%dplyr::count()
+plot_cate=cbind(cate1,cate2)%>%select(2,4)%>%rename(low=1,high=2)%>%cbind(loc=1:3)
+ggplot(train_data,aes(x=popularity_class))+geom_bar(stat="count")+geom_segment(data=plot_cate,aes(x=loc-0.45,xend=loc+0.45,y=low,yend=low),color="dodgerblue")+geom_segment(data=plot_cate,aes(x=loc-0.45,xend=loc+0.45,y=high,yend=high),color="violet")
+```
+
+Too much weight has been imposed on songs with popularity of (25,30] and (60,65], while those in (30,35] and (55,60] remains the same, which is unreasonable. This pushes a lot of points on the boundary into more extreme classes and leads to a misclassification. Actually, these songs should be treated equally as no evidence supports a huge distinction exists between them. What we should focus on more are the ones with extreme popularity.
+
+### Weighted Oversampling for classification problem
+
+```{R,message=FALSE}
+set.seed(1)
+p=plot_my_version1(data$popularity)
+p
+```
+
+```{R,message=FALSE}
+data=full_join(full_join(data_70s,data_80s),data_90s)
+set.seed(1)
+p=plot_my_version2(data$popularity)
+p
+```
+
+#### 3 classification
+
+first weight function:
+
+```{R,message=FALSE,echo=TRUE,results="hide"}
+set.seed(1)
+pred=c()
+reference=c()
+pred2=c()
+reference2=c()
+for(i in 1:10){
+  result=oversample_class1(data)
+  reference=c(reference,result[[1]]$response)
+  pred=c(pred,result[[1]]$predictor)
+  reference2=c(reference2,result[[2]]$response)
+  pred2=c(pred2,result[[2]]$predictor)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+reference2=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")[reference2]
+indicator=confusionMatrix(data=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+```
+
+```{R}
+indicator$table/10
+tab=data.frame(predict=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reality=factor(reference2,levels=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")))
+t1=xtabs(~predict+reality,tab)/10
+t1
+Adjusted_Precision=c(sum(t1[1,1:3])/sum(t1[1,1:6]),NA,sum(t1[3,4:6])/sum(t1[3,1:6]))
+Extreme_Error=c(sum(t1[1,5:6])/sum(t1[1,1:6]),NA,sum(t1[3,1:2])/sum(t1[3,1:6]))
+Extreme_Sensitivity=c(sum(t1[1,1])/sum(t1[1:3,1]),NA,sum(t1[3,6])/sum(t1[1:3,6]))
+t1=round(rbind(t(indicator$byClass[,c(11,1)]),"Extreme Sensitivity"=Extreme_Sensitivity,"Precision"=indicator$byClass[,c(5)],"Adjusted Precision"=Adjusted_Precision,"Extreme Error"=Extreme_Error,"Specificty"=indicator$byClass[,c(2)]),digits=3)
+t1=as.data.frame(cbind("evaluation measures"=c("Balanced Accuracy","Sensitivity",  "Extreme Sensitivity","Precision","Adjusted Precision","Extreme Error","Specificty"),t1))
+t2=apply(matrix(as.numeric(as.matrix(t1[,2:4])),ncol=3),1,mean,na.rm=TRUE)
+t2
+
+f1=qflextable(t1)
+f1=bold(f1,i=1:7,j=1)
+f1=bold(f1,j=1:4,part="header")
+f1=bg(f1,i=c(3,5,6),j=1:4,bg="skyblue")
+f1=color(f1,i=c(3,5,6),j=2:4,"white")
+f1
+```
+
+second weight function:
+
+```{R,message=FALSE,echo=TRUE,results="hide"}
+set.seed(1)
+pred=c()
+reference=c()
+pred2=c()
+reference2=c()
+for(i in 1:10){
+  result=oversample_class2(data)
+  reference=c(reference,result[[1]]$response)
+  pred=c(pred,result[[1]]$predictor)
+  reference2=c(reference2,result[[2]]$response)
+  pred2=c(pred2,result[[2]]$predictor)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+reference2=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")[reference2]
+indicator=confusionMatrix(data=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+```
+
+```{R}
+indicator$table/10
+tab=data.frame(predict=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reality=factor(reference2,levels=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")))
+t1=xtabs(~predict+reality,tab)/10
+Adjusted_Precision=c(sum(t1[1,1:3])/sum(t1[1,1:6]),NA,sum(t1[3,4:6])/sum(t1[3,1:6]))
+Extreme_Error=c(sum(t1[1,5:6])/sum(t1[1,1:6]),NA,sum(t1[3,1:2])/sum(t1[3,1:6]))
+Extreme_Sensitivity=c(sum(t1[1,1])/sum(t1[1:3,1]),NA,sum(t1[3,6])/sum(t1[1:3,6]))
+t1=round(rbind(t(indicator$byClass[,c(11,1)]),"Extreme Sensitivity"=Extreme_Sensitivity,"Precision"=indicator$byClass[,c(5)],"Adjusted Precision"=Adjusted_Precision,"Extreme Error"=Extreme_Error,"Specificty"=indicator$byClass[,c(2)]),digits=3)
+t1=as.data.frame(cbind("evaluation measures"=c("Balanced Accuracy","Sensitivity",  "Extreme Sensitivity","Precision","Adjusted Precision","Extreme Error","Specificty"),t1))
+t2=apply(matrix(as.numeric(as.matrix(t1[,2:4])),ncol=3),1,mean,na.rm=TRUE)
+t2
+
+f1=qflextable(t1)
+f1=bold(f1,i=1:7,j=1)
+f1=bold(f1,j=1:4,part="header")
+f1=bg(f1,i=c(3,5,6),j=1:4,bg="skyblue")
+f1=color(f1,i=c(3,5,6),j=2:4,"white")
+f1
+```
+
+We can see that the oversampling technique can effectively improve the accuracy, but a 50\% sensitivity is still a bit low for us. 
+
+#### 4 classification
+
+Another way to improve the accuracy is to firstly classify the songs into 4 classes and then merge two of them into one. This adds information to the learning process and helps the algorithm learn more effectively.
+
+```{R,message=FALSE}
+data2=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+ggplot(data2,aes(x=popularity_class))+geom_bar(stat="count")
+```
+
+```{R,message=FALSE}
+set.seed(1)
+reference=factor(c(),levels=c("[0,30]","(30,46]","(46,60]","(60,100]"))
+pred=c()
+reference2=c()
+pred2=c()
+for(i in 1:10){
+  data2=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+  result=simple_class2(data2)
+  reference=c(reference,result[[1]]$response)
+  pred=c(pred,result[[1]]$predictor)
+  reference2=c(reference2,result[[2]]$response)
+  pred2=c(pred2,result[[2]]$predictor)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+reference2=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")[reference2]
+indicator=confusionMatrix(data=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+```
+
+```{R}
+indicator$table/10
+tab=data.frame(predict=factor(pred2,levels=c("[0,30]","(30,60]","(60,100]")),reality=factor(reference2,levels=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")))
+t1=xtabs(~predict+reality,tab)/10
+t1
+Adjusted_Precision=c(sum(t1[1,1:3])/sum(t1[1,1:6]),NA,sum(t1[3,4:6])/sum(t1[3,1:6]))
+Extreme_Error=c(sum(t1[1,5:6])/sum(t1[1,1:6]),NA,sum(t1[3,1:2])/sum(t1[3,1:6]))
+Extreme_Sensitivity=c(sum(t1[1,1])/sum(t1[1:3,1]),NA,sum(t1[3,6])/sum(t1[1:3,6]))
+t1=round(rbind(t(indicator$byClass[,c(11,1)]),"Extreme Sensitivity"=Extreme_Sensitivity,"Precision"=indicator$byClass[,c(5)],"Adjusted Precision"=Adjusted_Precision,"Extreme Error"=Extreme_Error,"Specificty"=indicator$byClass[,c(2)]),digits=3)
+t1=as.data.frame(cbind("evaluation measures"=c("Balanced Accuracy","Sensitivity",  "Extreme Sensitivity","Precision","Adjusted Precision","Extreme Error","Specificty"),t1))
+t2=apply(matrix(as.numeric(as.matrix(t1[,2:4])),ncol=3),1,mean,na.rm=TRUE)
+t2
+
+f1=qflextable(t1)
+f1=bold(f1,i=1:7,j=1)
+f1=bold(f1,j=1:4,part="header")
+f1=bg(f1,i=c(3,5,6),j=1:4,bg="skyblue")
+f1=color(f1,i=c(3,5,6),j=2:4,"white")
+f1
+```
+first weight with equal number for the 4 classes:
+
+```{R,message=FALSE}
+data2=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+set.seed(1)
+p1=plot_my_version3(data2$popularity)
+show=rbind(data2,data2[createDataPartition_my_version3(data2$popularity,list=F),])
+p2=ggplot(show,aes(x=popularity_class))+geom_bar(stat="count",fill="#f47983")
+plot_grid(p1,p2,nrow=2)
+```
+
+```{R,message=FALSE}
+set.seed(1)
+pred=c()
+reference=c()
+pred2=c()
+reference2=c()
+for(i in 1:10){
+  data2=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+  result=oversample_class3(data2)
+  reference=c(reference,result[[1]]$response)
+  pred=c(pred,result[[1]]$predictor)
+  reference2=c(reference2,result[[2]]$response)
+  pred2=c(pred2,result[[2]]$predictor)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+reference2=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")[reference2]
+indicator=confusionMatrix(data=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+```
+
+```{R}
+indicator$table/10
+tab=data.frame(predict=factor(pred2,levels=c("[0,30]","(30,60]","(60,100]")),reality=factor(reference2,levels=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")))
+t1=xtabs(~predict+reality,tab)/10
+t1
+Adjusted_Precision=c(sum(t1[1,1:3])/sum(t1[1,1:6]),NA,sum(t1[3,4:6])/sum(t1[3,1:6]))
+Extreme_Error=c(sum(t1[1,5:6])/sum(t1[1,1:6]),NA,sum(t1[3,1:2])/sum(t1[3,1:6]))
+Extreme_Sensitivity=c(sum(t1[1,1])/sum(t1[1:3,1]),NA,sum(t1[3,6])/sum(t1[1:3,6]))
+t1=round(rbind(t(indicator$byClass[,c(11,1)]),"Extreme Sensitivity"=Extreme_Sensitivity,"Precision"=indicator$byClass[,c(5)],"Adjusted Precision"=Adjusted_Precision,"Extreme Error"=Extreme_Error,"Specificty"=indicator$byClass[,c(2)]),digits=3)
+t1=as.data.frame(cbind("evaluation measures"=c("Balanced Accuracy","Sensitivity",  "Extreme Sensitivity","Precision","Adjusted Precision","Extreme Error","Specificty"),t1))
+t2=apply(matrix(as.numeric(as.matrix(t1[,2:4])),ncol=3),1,mean,na.rm=TRUE)
+t2
+
+f1=qflextable(t1)
+f1=bold(f1,i=1:7,j=1)
+f1=bold(f1,j=1:4,part="header")
+f1=bg(f1,i=c(3,5,6),j=1:4,bg="skyblue")
+f1=color(f1,i=c(3,5,6),j=2:4,"white")
+f1
+```
+
+second weight with equal number for the 4 classes:
+
+```{R,message=FALSE}
+data2=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+set.seed(1)
+p1=plot_my_version4(data2$popularity)
+show=rbind(data2,data2[createDataPartition_my_version4(data2$popularity,list=F),])
+p2=ggplot(show,aes(x=popularity_class))+geom_bar(stat="count",fill="lightblue")
+plot_grid(p1,p2,nrow=2)
+```
+
+```{R,message=FALSE}
+set.seed(1)
+pred=c()
+reference=c()
+pred2=c()
+reference2=c()
+for(i in 1:10){
+  data2=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+  result=oversample_class4(data2)
+  reference=c(reference,result[[1]]$response)
+  pred=c(pred,result[[1]]$predictor)
+  reference2=c(reference2,result[[2]]$response)
+  pred2=c(pred2,result[[2]]$predictor)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+reference2=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")[reference2]
+indicator=confusionMatrix(data=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+```
+
+```{R}
+indicator$table/10
+tab=data.frame(predict=factor(pred2,levels=c("[0,30]","(30,60]","(60,100]")),reality=factor(reference2,levels=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")))
+t1=xtabs(~predict+reality,tab)/10
+t1
+Adjusted_Precision=c(sum(t1[1,1:3])/sum(t1[1,1:6]),NA,sum(t1[3,4:6])/sum(t1[3,1:6]))
+Extreme_Error=c(sum(t1[1,5:6])/sum(t1[1,1:6]),NA,sum(t1[3,1:2])/sum(t1[3,1:6]))
+Extreme_Sensitivity=c(sum(t1[1,1])/sum(t1[1:3,1]),NA,sum(t1[3,6])/sum(t1[1:3,6]))
+t1=round(rbind(t(indicator$byClass[,c(11,1)]),"Extreme Sensitivity"=Extreme_Sensitivity,"Precision"=indicator$byClass[,c(5)],"Adjusted Precision"=Adjusted_Precision,"Extreme Error"=Extreme_Error,"Specificty"=indicator$byClass[,c(2)]),digits=3)
+t1=as.data.frame(cbind("evaluation measures"=c("Balanced Accuracy","Sensitivity",  "Extreme Sensitivity","Precision","Adjusted Precision","Extreme Error","Specificty"),t1))
+t2=apply(matrix(as.numeric(as.matrix(t1[,2:4])),ncol=3),1,mean,na.rm=TRUE)
+t2
+
+f1=qflextable(t1)
+f1=bold(f1,i=1:7,j=1)
+f1=bold(f1,j=1:4,part="header")
+f1=bg(f1,i=c(3,5,6),j=1:4,bg="skyblue")
+f1=color(f1,i=c(3,5,6),j=2:4,"white")
+f1
+```
+
+first weight with equal number for the 3 classes:
+
+```{R,message=FALSE}
+data2=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+set.seed(1)
+p1=plot_my_version5(data2$popularity)
+show=rbind(data2,data2[createDataPartition_my_version1(data2$popularity,list=F),])
+p2=ggplot(show,aes(x=popularity_class))+geom_bar(stat="count",fill="#f47983")
+plot_grid(p1,p2,nrow=2)
+```
+
+
+```{R,message=FALSE}
+set.seed(1)
+pred=c()
+reference=c()
+pred2=c()
+reference2=c()
+for(i in 1:10){
+  data2=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+  result=oversample_class5(data2)
+  reference=c(reference,result[[1]]$response)
+  pred=c(pred,result[[1]]$predictor)
+  reference2=c(reference2,result[[2]]$response)
+  pred2=c(pred2,result[[2]]$predictor)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+reference2=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")[reference2]
+indicator=confusionMatrix(data=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+```
+
+```{R}
+indicator$table/10
+tab=data.frame(predict=factor(pred2,levels=c("[0,30]","(30,60]","(60,100]")),reality=factor(reference2,levels=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")))
+t1=xtabs(~predict+reality,tab)/10
+t1
+Adjusted_Precision=c(sum(t1[1,1:3])/sum(t1[1,1:6]),NA,sum(t1[3,4:6])/sum(t1[3,1:6]))
+Extreme_Error=c(sum(t1[1,5:6])/sum(t1[1,1:6]),NA,sum(t1[3,1:2])/sum(t1[3,1:6]))
+Extreme_Sensitivity=c(sum(t1[1,1])/sum(t1[1:3,1]),NA,sum(t1[3,6])/sum(t1[1:3,6]))
+t1=round(rbind(t(indicator$byClass[,c(11,1)]),"Extreme Sensitivity"=Extreme_Sensitivity,"Precision"=indicator$byClass[,c(5)],"Adjusted Precision"=Adjusted_Precision,"Extreme Error"=Extreme_Error,"Specificty"=indicator$byClass[,c(2)]),digits=3)
+t1=as.data.frame(cbind("evaluation measures"=c("Balanced Accuracy","Sensitivity",  "Extreme Sensitivity","Precision","Adjusted Precision","Extreme Error","Specificty"),t1))
+t2=apply(matrix(as.numeric(as.matrix(t1[,2:4])),ncol=3),1,mean,na.rm=TRUE)
+t2
+
+f1=qflextable(t1)
+f1=bold(f1,i=1:7,j=1)
+f1=bold(f1,j=1:4,part="header")
+f1=bg(f1,i=c(3,5,6),j=1:4,bg="skyblue")
+f1=color(f1,i=c(3,5,6),j=2:4,"white")
+f1
+```
+
+second weight with equal number for the 3 classes:
+```{R,message=FALSE}
+data2=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+set.seed(1)
+p1=plot_my_version6(data2$popularity)
+show=rbind(data2,data2[createDataPartition_my_version2(data2$popularity,list=F),])
+p2=ggplot(show,aes(x=popularity_class))+geom_bar(stat="count",fill="lightblue")
+plot_grid(p1,p2,nrow=2)
+```
+
+```{R,message=FALSE}
+set.seed(1)
+pred=c()
+reference=c()
+pred2=c()
+reference2=c()
+for(i in 1:10){
+  data2=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+  result=oversample_class6(data2)
+  reference=c(reference,result[[1]]$response)
+  pred=c(pred,result[[1]]$predictor)
+  reference2=c(reference2,result[[2]]$response)
+  pred2=c(pred2,result[[2]]$predictor)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+reference2=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")[reference2]
+indicator=confusionMatrix(data=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+```
+
+```{R}
+indicator$table/10
+tab=data.frame(predict=factor(pred2,levels=c("[0,30]","(30,60]","(60,100]")),reality=factor(reference2,levels=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")))
+t1=xtabs(~predict+reality,tab)/10
+t1
+Adjusted_Precision=c(sum(t1[1,1:3])/sum(t1[1,1:6]),NA,sum(t1[3,4:6])/sum(t1[3,1:6]))
+Extreme_Error=c(sum(t1[1,5:6])/sum(t1[1,1:6]),NA,sum(t1[3,1:2])/sum(t1[3,1:6]))
+Extreme_Sensitivity=c(sum(t1[1,1])/sum(t1[1:3,1]),NA,sum(t1[3,6])/sum(t1[1:3,6]))
+t1=round(rbind(t(indicator$byClass[,c(11,1)]),"Extreme Sensitivity"=Extreme_Sensitivity,"Precision"=indicator$byClass[,c(5)],"Adjusted Precision"=Adjusted_Precision,"Extreme Error"=Extreme_Error,"Specificty"=indicator$byClass[,c(2)]),digits=3)
+t1=as.data.frame(cbind("evaluation measures"=c("Balanced Accuracy","Sensitivity",  "Extreme Sensitivity","Precision","Adjusted Precision","Extreme Error","Specificty"),t1))
+t2=apply(matrix(as.numeric(as.matrix(t1[,2:4])),ncol=3),1,mean,na.rm=TRUE)
+t2
+
+f1=qflextable(t1)
+f1=bold(f1,i=1:7,j=1)
+f1=bold(f1,j=1:4,part="header")
+f1=bg(f1,i=c(3,5,6),j=1:4,bg="skyblue")
+f1=color(f1,i=c(3,5,6),j=2:4,"white")
+f1
+```
+#### Regression
+first weight with regression:
+```{R,message=FALSE,include=FALSE}
+set.seed(1)
+pred=c()
+reference=c()
+pred2=c()
+reference2=c()
+for(i in 1:10){
+  data2=data
+  result=oversample_class7(data2)
+  reference=c(reference,result[[1]]$response)
+  pred=c(pred,result[[1]]$predictor)
+  reference2=c(reference2,result[[2]]$response)
+  pred2=c(pred2,result[[2]]$predictor)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+reference2=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")[reference2]
+pred=c("[0,30]","(30,60]","(60,100]")[pred]
+pred2=c("[0,30]","(30,60]","(60,100]")[pred2]
+indicator=confusionMatrix(data=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+```
+
+```{R}
+indicator$table/10
+tab=data.frame(predict=factor(pred2,levels=c("[0,30]","(30,60]","(60,100]")),reality=factor(reference2,levels=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")))
+t1=xtabs(~predict+reality,tab)/10
+t1
+Adjusted_Precision=c(sum(t1[1,1:3])/sum(t1[1,1:6]),NA,sum(t1[3,4:6])/sum(t1[3,1:6]))
+Extreme_Error=c(sum(t1[1,5:6])/sum(t1[1,1:6]),NA,sum(t1[3,1:2])/sum(t1[3,1:6]))
+Extreme_Sensitivity=c(sum(t1[1,1])/sum(t1[1:3,1]),NA,sum(t1[3,6])/sum(t1[1:3,6]))
+t1=round(rbind(t(indicator$byClass[,c(11,1)]),"Extreme Sensitivity"=Extreme_Sensitivity,"Precision"=indicator$byClass[,c(5)],"Adjusted Precision"=Adjusted_Precision,"Extreme Error"=Extreme_Error,"Specificty"=indicator$byClass[,c(2)]),digits=3)
+t1=as.data.frame(cbind("evaluation measures"=c("Balanced Accuracy","Sensitivity",  "Extreme Sensitivity","Precision","Adjusted Precision","Extreme Error","Specificty"),t1))
+t2=apply(matrix(as.numeric(as.matrix(t1[,2:4])),ncol=3),1,mean,na.rm=TRUE)
+t2
+
+f1=qflextable(t1)
+f1=bold(f1,i=1:7,j=1)
+f1=bold(f1,j=1:4,part="header")
+f1=bg(f1,i=c(3,5,6),j=1:4,bg="skyblue")
+f1=color(f1,i=c(3,5,6),j=2:4,"white")
+f1
+```
+
+second weight with regression:
+```{R,message=FALSE,include=FALSE}
+set.seed(1)
+pred=c()
+reference=c()
+pred2=c()
+reference2=c()
+for(i in 1:10){
+  data2=data
+  result=oversample_class8(data2)
+  reference=c(reference,result[[1]]$response)
+  pred=c(pred,result[[1]]$predictor)
+  reference2=c(reference2,result[[2]]$response)
+  pred2=c(pred2,result[[2]]$predictor)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+reference2=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")[reference2]
+pred=c("[0,30]","(30,60]","(60,100]")[pred]
+pred2=c("[0,30]","(30,60]","(60,100]")[pred2]
+indicator=confusionMatrix(data=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+```
+
+```{R}
+indicator$table/10
+tab=data.frame(predict=factor(pred2,levels=c("[0,30]","(30,60]","(60,100]")),reality=factor(reference2,levels=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")))
+t1=xtabs(~predict+reality,tab)/10
+t1
+Adjusted_Precision=c(sum(t1[1,1:3])/sum(t1[1,1:6]),NA,sum(t1[3,4:6])/sum(t1[3,1:6]))
+Extreme_Error=c(sum(t1[1,5:6])/sum(t1[1,1:6]),NA,sum(t1[3,1:2])/sum(t1[3,1:6]))
+Extreme_Sensitivity=c(sum(t1[1,1])/sum(t1[1:3,1]),NA,sum(t1[3,6])/sum(t1[1:3,6]))
+t1=round(rbind(t(indicator$byClass[,c(11,1)]),"Extreme Sensitivity"=Extreme_Sensitivity,"Precision"=indicator$byClass[,c(5)],"Adjusted Precision"=Adjusted_Precision,"Extreme Error"=Extreme_Error,"Specificty"=indicator$byClass[,c(2)]),digits=3)
+t1=as.data.frame(cbind("evaluation measures"=c("Balanced Accuracy","Sensitivity",  "Extreme Sensitivity","Precision","Adjusted Precision","Extreme Error","Specificty"),t1))
+t2=apply(matrix(as.numeric(as.matrix(t1[,2:4])),ncol=3),1,mean,na.rm=TRUE)
+t2
+
+f1=qflextable(t1)
+f1=bold(f1,i=1:7,j=1)
+f1=bold(f1,j=1:4,part="header")
+f1=bg(f1,i=c(3,5,6),j=1:4,bg="skyblue")
+f1=color(f1,i=c(3,5,6),j=2:4,"white")
+f1
+```
+
+### Application of the two weights onto 74-76 and 84-86 data: important variables and special songs
+
+
+```{R,message=FALSE}
+temp=data_75s%>%na.omit()%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,60,100),include.lowest=TRUE))%>%mutate(label="test_75s")
+show=full_join(data%>%mutate(label="train"),temp)%>%mutate(label=factor(label,levels = c("train","test_75s")))
+ggplot(show)+geom_histogram(aes(x=popularity,y=..density..))+geom_segment(x=30,xend=30,y=0,yend=0.025,color="pink")+geom_segment(x=60,xend=60,y=0,yend=0.025,color="skyblue")+facet_grid(label~.)
+```
+the first method:
+
+```{R,message=FALSE}
+data2=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+set.seed(1)
+p1=plot_my_version3(data2$popularity)
+show=rbind(data2,data2[createDataPartition_my_version3(data2$popularity,list=F),])
+p2=ggplot(show,aes(x=popularity_class))+geom_bar(stat="count",fill="#f47983")
+plot_grid(p1,p2,nrow=2)
+```
+
+```{R,message=FALSE}
+training_data=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+testing_data=data_75s%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+
+set.seed(1)
+pred=c()
+reference=c()
+pred2=c()
+feature=c()
+feature_gain=c()
+reference2=c()
+for(i in 1:50){
+  result=oversample_class_test2(training_data,testing_data)
+  reference=c(reference,result[[1]]$response)
+  pred=c(pred,result[[1]]$predictor)
+  reference2=c(reference2,result[[2]]$response)
+  pred2=c(pred2,result[[2]]$predictor)
+   feature=c(feature,result[[3]]$Feature)
+  feature_gain=c(feature_gain,result[[3]]$Gain)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+reference2=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")[reference2]
+indicator=confusionMatrix(data=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+feature=matrix(feature,ncol=35,byrow=TRUE)
+feature_gain=matrix(feature_gain,ncol=35,byrow=TRUE)
+```
+
+```{R}
+indicator$table/50
+tab=data.frame(predict=factor(pred2,levels=c("[0,30]","(30,60]","(60,100]")),reality=factor(reference2,levels=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")))
+t1=xtabs(~predict+reality,tab)/50
+t1
+Adjusted_Precision=c(sum(t1[1,1:3])/sum(t1[1,1:6]),NA,sum(t1[3,4:6])/sum(t1[3,1:6]))
+Extreme_Error=c(sum(t1[1,5:6])/sum(t1[1,1:6]),NA,sum(t1[3,1:2])/sum(t1[3,1:6]))
+Extreme_Sensitivity=c(sum(t1[1,1])/sum(t1[1:3,1]),NA,sum(t1[3,6])/sum(t1[1:3,6]))
+t1=round(rbind(t(indicator$byClass[,c(11,1)]),"Extreme Sensitivity"=Extreme_Sensitivity,"Precision"=indicator$byClass[,c(5)],"Adjusted Precision"=Adjusted_Precision,"Extreme Error"=Extreme_Error,"Specificty"=indicator$byClass[,c(2)]),digits=3)
+t1=as.data.frame(cbind("evaluation measures"=c("Balanced Accuracy","Sensitivity",  "Extreme Sensitivity","Precision","Adjusted Precision","Extreme Error","Specificty"),t1))
+f1=qflextable(t1)
+f1=bold(f1,i=1:7,j=1)
+f1=bold(f1,j=1:4,part="header")
+f1=bg(f1,i=c(3,5,6),j=1:4,bg="skyblue")
+f1=color(f1,i=c(3,5,6),j=2:4,"white")
+f1
+times=feature[,1:10]
+times=sort(table(factor(times)),decreasing = TRUE)
+show=c()
+for(i in 1:length(names(times))){
+  gain_temp=feature_gain[,1:10][which(feature[,1:10]==names(times)[i])]
+  show=rbind(show,data.frame(gain=gain_temp,feature_name=names(times)[i],times=times[i]))
+}
+show$times=factor(show$times)
+ggplot(show,aes(y=gain))+geom_boxplot(aes(fill=factor(times)))+facet_wrap(~feature_name,nrow=4)
+```
+
+
+the second method:
+
+```{R,message=FALSE}
+set.seed(1)
+p1=plot_my_version5(data$popularity)
+show=rbind(data,data[createDataPartition_my_version1(data$popularity,list=F),])
+p2=ggplot(show,aes(x=popularity_class))+geom_bar(stat="count",fill="#f47983")
+plot_grid(p1,p2,nrow=2)
+```
+
+```{R,message=FALSE}
+training_data=data%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+testing_data=data_75s%>%mutate(popularity_class=cut(popularity,breaks=c(0,30,46,60,100),include.lowest=TRUE))
+
+set.seed(1)
+pred=c()
+reference=c()
+pred2=c()
+reference2=c()
+feature=c()
+feature_gain=c()
+for(i in 1:50){
+  result=oversample_class_test1(training_data,testing_data)
+  reference=c(reference,result[[1]]$response)
+  pred=c(pred,result[[1]]$predictor)
+  reference2=c(reference2,result[[2]]$response)
+  pred2=c(pred2,result[[2]]$predictor)
+  feature=c(feature,result[[3]]$Feature)
+  feature_gain=c(feature_gain,result[[3]]$Gain)
+}
+reference=c("[0,30]","(30,60]","(60,100]")[reference]
+reference2=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")[reference2]
+indicator=confusionMatrix(data=factor(pred,levels=c("[0,30]","(30,60]","(60,100]")),reference=factor(reference,levels=c("[0,30]","(30,60]","(60,100]")),mode="everything")
+feature=matrix(feature,ncol=35,byrow=TRUE)
+feature_gain=matrix(feature_gain,ncol=35,byrow=TRUE)
+```
+
+```{R}
+indicator$table/50
+tab=data.frame(predict=factor(pred2,levels=c("[0,30]","(30,60]","(60,100]")),reality=factor(reference2,levels=c("[0,20]","(20,30]","(30,45]","(45,60]","(60,70]","(70,100]")))
+t1=xtabs(~predict+reality,tab)/50
+t1
+Adjusted_Precision=c(sum(t1[1,1:3])/sum(t1[1,1:6]),NA,sum(t1[3,4:6])/sum(t1[3,1:6]))
+Extreme_Error=c(sum(t1[1,5:6])/sum(t1[1,1:6]),NA,sum(t1[3,1:2])/sum(t1[3,1:6]))
+Extreme_Sensitivity=c(sum(t1[1,1])/sum(t1[1:3,1]),NA,sum(t1[3,6])/sum(t1[1:3,6]))
+t1=round(rbind(t(indicator$byClass[,c(11,1)]),"Extreme Sensitivity"=Extreme_Sensitivity,"Precision"=indicator$byClass[,c(5)],"Adjusted Precision"=Adjusted_Precision,"Extreme Error"=Extreme_Error,"Specificty"=indicator$byClass[,c(2)]),digits=3)
+t1=as.data.frame(cbind("evaluation measures"=c("Balanced Accuracy","Sensitivity",  "Extreme Sensitivity","Precision","Adjusted Precision","Extreme Error","Specificty"),t1))
+f1=qflextable(t1)
+f1=bold(f1,i=1:7,j=1)
+f1=bold(f1,j=1:4,part="header")
+f1=bg(f1,i=c(3,5,6),j=1:4,bg="skyblue")
+f1=color(f1,i=c(3,5,6),j=2:4,"white")
+f1
+times=feature[,1:10]
+times=sort(table(factor(times)),decreasing = TRUE)
+show=c()
+for(i in 1:length(names(times))){
+  gain_temp=feature_gain[,1:10][which(feature[,1:10]==names(times)[i])]
+  show=rbind(show,data.frame(gain=gain_temp,feature_name=names(times)[i],times=times[i]))
+}
+show$times=factor(show$times)
+ggplot(show,aes(y=gain))+geom_boxplot(aes(fill=factor(times)))+facet_wrap(~feature_name,nrow=4)
+```
+
+```{R,message=FALSE}
+a1=testing_data[which(pred2=="[0,30]"&reference2=="(70,100]")%%624,]
+n=(a1%>%group_by(name)%>%count())
+kable(full_join(n,unique(a1))%>%filter(n>=10)%>%select(n,popularity,artist_popularity,covering_intensity4,year_board,count)%>%arrange(desc(n)))
+filter(covering,track_name=="Hooked On A Feeling")
+include_graphics("graph1.jpg")
+no=filter(song_75s,track_name=="Some Kind Of Wonderful")$number[1]
+track_search(no)%>%filter(grepl(tolower("Some Kind Of Wonderful"),tolower(as.character(track_name)),fixed=TRUE))%>%select(track_name,artist_name,release_date,popularity)%>%arrange(release_date)
+```
+*Hooked On A Feeling* was covered by a Blue Swede,a Swedish band, and was made a massive hit, reaching #1 in the US, Holland, Australia, and Canada.As the first Swedish singer to score a No. 1 hit in the U.S., Blue Swede paved the way for well-known ABBA. However, they themselves have never again cracked the American market. As you can see, the song was quickly forgotten and did not hit the year board.
+
+(https://www.songfacts.com/facts/bj-thomas/hooked-on-a-feeling)
+
+In 2014, the song was used in the hot film *Guardians of the Galaxy*,which helped it return to #1 in America and revived this song.
+(The picture comes from https://www.wnycstudios.org/podcasts/soundcheck/segments/that-was-a-hit-hooked-feeling-blue-swede)
+
+*Some Kind Of Wonderful* is also interesting because the popularity for 1999 remastered version is a lot higher than the 1974 version, possibly leading to a misclassification. I review the history of this song and found that it was used as the background music for the famous game *Grand Theft Auto* in 2004. So maybe the listeners of this song are not the classical music fanciers and cannot use the classical predictors to correctly categorize it.
+
+```{R,message=FALSE}
+a2=testing_data[which(pred2=="(60,100]"&(reference2=="[0,20]"))%%624,]
+n=(a2%>%group_by(name)%>%count())
+kable(full_join(n,unique(a2))%>%filter(n>=20)%>%select(n,popularity,artist_popularity,covering_intensity4,year_board,count)%>%arrange(desc(n)))
+
+no=filter(song_75s,track_name=="Shotgun Shuffle")$number[1]
+track_search(no)%>%select(track_name,artist_name,release_date,popularity)%>%arrange(release_date)
+
+no=filter(song_75s,track_name=="On And On")$number[1]
+track_search(no)%>%select(track_name,artist_name,release_date,popularity)%>%arrange(release_date)
+filter(PopUSA_75s,track_name=="On And On")
+
+no=filter(song_75s,track_name=="TVC 15")$number[1]
+track_search(no)%>%select(track_name,artist_name,release_date,popularity)%>%arrange(release_date)
+
+no=filter(song_75s,track_name=="Kung Fu")$number[1]
+track_search(no)%>%select(track_name,artist_name,release_date,popularity)%>%arrange(release_date)
+
+no=filter(song_75s,track_name=="Put A Little Love Away")$number[1]
+track_search(no)%>%select(track_name,artist_name,release_date,popularity)%>%arrange(release_date)
+
+no=filter(song_75s,track_name=="Good Vibrations")$number[1]
+track_search(no)%>%select(track_name,artist_name,release_date,popularity)%>%arrange(release_date)
+
+no=filter(song_75s,track_name=="Wake Up Susan")$number[1]
+track_search(no)%>%select(track_name,artist_name,release_date,popularity)%>%arrange(release_date)
+
+no=filter(song_75s,track_name=="Once You Hit The Road")$number[1]
+track_search(no)%>%select(track_name,artist_name,release_date,popularity)%>%arrange(release_date)
+```
+
+Missing values might occur when scratching *Shotgun Shuffle*,*Put A Little Love Away* and *On and On* because none of them have records around 1974-1976. 
+
+*TVC 15* and all of its cover versions have low popularity and I guess this can be owed to its bizarre name.
+
+The songs *Kung Fu* and *Real Man* may be misclassified because there are too many duplicated songs. As you can see, many songs I searched contain the phrase "Kung Fu" but not exactly the original track.
+
+For *Good Viberations*, this was a song sung by the American rock band the Beach Boys in 1966 and immediately became a commercial hit. "Characterized by its complex soundscapes, episodic structure and subversions of pop music formula, it was the most expensive single ever recorded." Many subsequent versions came out, including our target, the one covered by Todd Rundgren which peaked at 34. However, the cover version is apparently forgotten while the original track remains a high popularity.
+
+For *Wake Up Susan*(peaked at 56), I found that the group The Spinners had other hits *I'm Coming Home*, *The Rubberband Man* and *Love or Leave*.However, except for *The Rubberband Man* (This track reached top 2 in 1976), popularity values of others are all below 30. Hence despite for the effectiveness of the "year_board" variable, a more detailed feature can make the classification more precise. For example, we can consider whether the track ever topped in the board or not. It is a pity that we could not get that information.
+
+```{R,message=FALSE}
+a3=testing_data[which(pred2=="(60,100]"&(reference2=="(70,100]"))%%624,]
+a4=testing_data[which(pred2=="(60,100]"&(reference2=="(60,70]"))%%624,]
+n=(a3%>%group_by(name)%>%count())
+kable(full_join(n,unique(a3))%>%filter(n>=30)%>%select(n,popularity,artist_popularity,covering_intensity4,year_board,count)%>%arrange(desc(n)))
+n=(a4%>%group_by(name)%>%count())
+kable(full_join(n,unique(a4))%>%filter(n>=30)%>%select(n,popularity,artist_popularity,covering_intensity4,year_board,count)%>%arrange(desc(n)))
+```
+
+
