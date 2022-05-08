@@ -10,7 +10,7 @@ These songs are often called classics because they are not buried in oblivion ov
 * `Data_prediction.R`     Code for prediction
 * `Reproduce.Rmd`       Reproduce all the results 
 * `final_report.pdf`    Final report
-* `final_slides.pdf`    Final presentation slides
+* `presentation_for_musical_analysis.pdf`    Final presentation slides
 ## Dependencies
 * knitr
 * spotifyr
